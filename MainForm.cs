@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Drawing;
 using System.IO;
+using System.Media;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -29,6 +30,7 @@ public sealed class MainForm : Form
     private readonly StatusStrip statusStrip = new();
     private CancellationTokenSource? cancellation;
     private Process? activeProcess;
+    private readonly StringBuilder downloaderErrors = new();
 
     private static readonly Regex ProgressRegex = new(
         @"^download:(?<percent>[0-9.,]+)%\|(?<speed>[^|]*)\|(?<eta>.*)$",
@@ -60,7 +62,11 @@ public sealed class MainForm : Form
         cancelButton.Click += (_, _) => CancelDownload();
         browseButton.Click += (_, _) => ChooseFolder();
         KeyDown += HandleKeyDown;
-        Shown += (_, _) => urlBox.Focus();
+        Shown += async (_, _) =>
+        {
+            urlBox.Focus();
+            await InitializeUpdatesAsync();
+        };
     }
 
     private void BuildInterface()
@@ -292,6 +298,46 @@ public sealed class MainForm : Form
         }
     }
 
+    private async Task InitializeUpdatesAsync()
+    {
+        SetStatus("Proveravam ažuriranja aplikacije i alata…", 0, "Ažuriranje");
+        try
+        {
+            AppUpdater.ToolUpdateResult tools = await AppUpdater.UpdateToolsAsync(
+                message => SetStatus(message, 0, "Ažuriranje"), CancellationToken.None);
+            if (tools.YtDlpUpdated || tools.FfmpegUpdated)
+                SetStatus("Alati su ažurirani i spremni za rad.", 0, "Ažuriranje završeno");
+            else
+                SetStatus("Aplikacija i alati su ažurni.", 0, "Spremno");
+
+            AppUpdater.ApplicationUpdate? application = await AppUpdater.CheckApplicationUpdateAsync(CancellationToken.None);
+            if (application is null)
+                return;
+
+            SystemSounds.Question.Play();
+            DialogResult answer = MessageBox.Show(
+                this,
+                $"Dostupna je nova verzija aplikacije ({application.Tag}). Preuzeti i instalirati ažuriranje sada?",
+                "Dostupno ažuriranje",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button1);
+            if (answer != DialogResult.Yes)
+                return;
+
+            SetStatus("Preuzimam ažuriranje. Program će se zatim ponovo pokrenuti…", 0, "Ažuriranje aplikacije");
+            await AppUpdater.InstallApplicationUpdateAsync(application, CancellationToken.None);
+            SystemSounds.Asterisk.Play();
+            Application.Exit();
+        }
+        catch (Exception error)
+        {
+            SetStatus("Automatsko ažuriranje nije uspelo. Možete pokušati ponovo kasnije.", 0, "Ažuriranje nije uspelo");
+            SystemSounds.Exclamation.Play();
+            Debug.WriteLine(error);
+        }
+    }
+
     private async Task StartDownloadAsync()
     {
         if (activeProcess is not null)
@@ -315,20 +361,31 @@ public sealed class MainForm : Form
         string? executable = FindExecutable("yt-dlp.exe");
         if (executable is null)
         {
-            MessageBox.Show(this, "Program yt-dlp.exe nije pronađen. Stavite ga pored OmniFetch.exe ili dodajte njegov folder u PATH.", "Nedostaje yt-dlp", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            PlayError("Nije moguće pokrenuti preuzimanje jer nedostaje yt-dlp. Pokrenite proveru ažuriranja ili vratite yt-dlp.exe u folder programa.");
+            return;
+        }
+        if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe")) ||
+            !File.Exists(Path.Combine(AppContext.BaseDirectory, "ffprobe.exe")))
+        {
+            PlayError("Nije moguće obraditi ovaj format jer nedostaje FFmpeg. Pokrenite ažuriranje ili vratite ffmpeg.exe i ffprobe.exe u folder programa.");
             return;
         }
 
         Directory.CreateDirectory(folder);
         cancellation = new CancellationTokenSource();
+        downloaderErrors.Clear();
         SetBusy(true);
+        SystemSounds.Beep.Play();
         SetStatus("Preuzimanje je u toku…", 0, "Pokrenuto");
 
         try
         {
             await Task.Run(() => RunDownloader(executable, url, folder, cancellation.Token), cancellation.Token);
             if (!cancellation.IsCancellationRequested)
+            {
+                SystemSounds.Asterisk.Play();
                 SetStatus("Preuzimanje je završeno.", 100, "Završeno");
+            }
         }
         catch (OperationCanceledException)
         {
@@ -336,8 +393,9 @@ public sealed class MainForm : Form
         }
         catch (Exception error)
         {
-            SetStatus("Preuzimanje nije uspelo.", progressBar.Value, "Greška");
-            MessageBox.Show(this, error.Message, "Greška pri preuzimanju", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            string explanation = ExplainDownloadError(error.Message + " " + downloaderErrors);
+            SetStatus(explanation, progressBar.Value, "Greška");
+            PlayError(explanation);
         }
         finally
         {
@@ -346,6 +404,29 @@ public sealed class MainForm : Form
             cancellation = null;
             SetBusy(false);
         }
+    }
+
+    private void PlayError(string explanation)
+    {
+        SystemSounds.Exclamation.Play();
+        SetStatus(explanation, progressBar.Value, "Greška");
+        MessageBox.Show(this, explanation, "Preuzimanje nije moguće", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+
+    private static string ExplainDownloadError(string details)
+    {
+        string text = details.ToLowerInvariant();
+        if (text.Contains("private") || text.Contains("login") || text.Contains("sign in") || text.Contains("authentication"))
+            return "Preuzimanje nije moguće: sadržaj je privatan ili zahteva prijavu. Program ne zaobilazi prijave i zaštite.";
+        if (text.Contains("drm") || text.Contains("encrypted"))
+            return "Preuzimanje nije moguće: sadržaj je zaštićen DRM enkripcijom, a program ne zaobilazi takvu zaštitu.";
+        if (text.Contains("geo") || text.Contains("country") || text.Contains("region"))
+            return "Preuzimanje nije moguće: sadržaj nije dostupan u vašem regionu.";
+        if (text.Contains("ffmpeg") || text.Contains("ffprobe"))
+            return "Preuzimanje nije moguće: FFmpeg alat nedostaje ili nije kompatibilan. Pokrenite ažuriranje programa.";
+        if (text.Contains("unsupported") || text.Contains("not supported"))
+            return "Preuzimanje nije moguće: ovaj sajt ili format trenutno nije podržan. Proverite URL i pokušajte ponovo.";
+        return "Preuzimanje nije moguće: URL nije javan, sajt trenutno nije podržan ili je sadržaj privremeno nedostupan. Proverite URL i pokušajte ponovo.";
     }
 
     private void RunDownloader(string executable, string url, string folder, CancellationToken token)
@@ -395,8 +476,13 @@ public sealed class MainForm : Form
         };
         process.ErrorDataReceived += (_, eventArgs) =>
         {
-            if (!string.IsNullOrWhiteSpace(eventArgs.Data) && !eventArgs.Data.Contains("[download]", StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(eventArgs.Data))
+                return;
+            if (!eventArgs.Data.Contains("[download]", StringComparison.OrdinalIgnoreCase))
+            {
+                downloaderErrors.AppendLine(eventArgs.Data);
                 Post(() => statusText.Text = eventArgs.Data);
+            }
         };
         process.Start();
         process.BeginOutputReadLine();
@@ -411,7 +497,7 @@ public sealed class MainForm : Form
         if (token.IsCancellationRequested)
             throw new OperationCanceledException(token);
         if (process.ExitCode != 0)
-            throw new InvalidOperationException("yt-dlp nije uspeo da preuzme ovaj URL. Proverite da li je sadržaj javan i da li ga yt-dlp podržava.");
+            throw new InvalidOperationException(downloaderErrors.ToString());
     }
 
     private void ParseOutput(string line)

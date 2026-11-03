@@ -19,8 +19,66 @@ jobs:
           dotnet-version: 8.0.x
       - name: Publish self-contained app
         run: dotnet publish .\OmniFetch.Windows.csproj --configuration Release --runtime ${{ matrix.runtime }} --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true --output .\publish\${{ matrix.runtime }}
+      - name: Add yt-dlp and FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $runtime = "${{ matrix.runtime }}"
+          $output = Join-Path $PWD "publish\$runtime"
+          $ytRelease = Invoke-RestMethod "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+          $ytAsset = switch ($runtime) {
+            "win-x86" { "yt-dlp_x86.exe" }
+            "win-arm64" { "yt-dlp_arm64.exe" }
+            default { "yt-dlp.exe" }
+          }
+          $yt = $ytRelease.assets | Where-Object name -eq $ytAsset | Select-Object -First 1
+          Invoke-WebRequest $yt.browser_download_url -OutFile (Join-Path $output "yt-dlp.exe")
+
+          $ffmpegRepo = if ($runtime -eq "win-x86") { "defisym/FFmpeg-Builds-Win32" } else { "BtbN/FFmpeg-Builds" }
+          $ffmpegRelease = Invoke-RestMethod "https://api.github.com/repos/$ffmpegRepo/releases/latest"
+          $ffmpegAsset = switch ($runtime) {
+            "win-x86" { "ffmpeg-master-latest-win32-gpl.zip" }
+            "win-arm64" { "ffmpeg-master-latest-winarm64-gpl.zip" }
+            default { "ffmpeg-master-latest-win64-gpl.zip" }
+          }
+          $ffmpeg = $ffmpegRelease.assets | Where-Object name -eq $ffmpegAsset | Select-Object -First 1
+          $archive = Join-Path $env:TEMP $ffmpegAsset
+          Invoke-WebRequest $ffmpeg.browser_download_url -OutFile $archive
+          $extract = Join-Path $env:TEMP ("omnifetch-ffmpeg-" + [guid]::NewGuid().ToString("N"))
+          Expand-Archive $archive -DestinationPath $extract
+          Copy-Item (Get-ChildItem $extract -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1).FullName $output -Force
+          Copy-Item (Get-ChildItem $extract -Recurse -Filter "ffprobe.exe" | Select-Object -First 1).FullName $output -Force
+
+          @{ ytDlpVersion = $ytRelease.tag_name; ffmpegVersion = $ffmpegRelease.tag_name; updatedAtUtc = (Get-Date).ToUniversalTime().ToString("o") } |
+            ConvertTo-Json | Set-Content (Join-Path $output "tools.json") -Encoding UTF8
+          Copy-Item .\THIRD-PARTY-NOTICES.md $output -Force
+          Remove-Item $archive -Force -ErrorAction SilentlyContinue
+          Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+      - name: Create portable archive
+        shell: pwsh
+        run: Compress-Archive -Path .\publish\${{ matrix.runtime }}\* -DestinationPath .\publish\OmniFetch-${{ matrix.runtime }}.zip -Force
       - name: Upload portable package
         uses: actions/upload-artifact@v4
         with:
           name: OmniFetch-${{ matrix.runtime }}
-          path: publish/${{ matrix.runtime }}
+          path: publish/OmniFetch-${{ matrix.runtime }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: OmniFetch-win-*
+          path: release
+          merge-multiple: true
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem .\release -Filter "*.zip"
+          gh release create $env:GITHUB_REF_NAME --repo $env:GITHUB_REPOSITORY --title "OmniFetch $env:GITHUB_REF_NAME" --generate-notes $files.FullName
