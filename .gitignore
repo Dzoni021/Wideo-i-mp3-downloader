@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+downloads/
+bin/
+obj/
+restore.log
+.nuget-packages/
+.nuget-http-cache/
+*.zip
+.opencode/
